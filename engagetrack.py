@@ -8,7 +8,6 @@ import cv2
 import numpy as np
 import torch
 from ultralytics import YOLO
-from torchvision.ops import nms
 import mediapipe as mp
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QLabel, QPushButton,
@@ -201,16 +200,13 @@ class VideoThread(QThread):
 
             annotated = frame.copy()
 
-            det_results = yolo.predict(frame, classes=[0], verbose=False)
-            if det_results[0].boxes is not None and len(det_results[0].boxes) > 0:
-                boxes_xyxy = det_results[0].boxes.xyxy.cpu()
-                confidences = det_results[0].boxes.conf.cpu()
-                keep_indices = nms(boxes_xyxy, confidences, iou_threshold=0.5)
-                filtered_boxes = boxes_xyxy[keep_indices]
-                results = yolo.track(frame, persist=True, classes=[0], tracker="bytetrack_classroom.yaml",
-                                     boxes=filtered_boxes)
-            else:
-                results = yolo.track(frame, persist=True, classes=[0], tracker="bytetrack_classroom.yaml")
+            results = yolo.track(
+                frame,
+                persist=True,
+                classes=[0],
+                tracker="bytetrack_classroom.yaml",
+                verbose=False
+            )
 
             active_ids = set()
             class_engaged_count = 0
@@ -335,7 +331,7 @@ class VideoThread(QThread):
 class EngageTrackApp(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("EngageTrack — Анализ вовлечённости")
+        self.setWindowTitle("EngageTrack — Анализ вовлечённости учащихся")
         self.resize(1150, 850)
         self.is_dark_mode = False
         self.disengagement_log = deque(maxlen=600)
