@@ -335,7 +335,7 @@ class VideoThread(QThread):
 class EngageTrackApp(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("EngageTrack — Анализ вовлечённости учащихся")
+        self.setWindowTitle("EngageTrack — Анализ вовлечённости")
         self.resize(1150, 850)
         self.is_dark_mode = False
         self.disengagement_log = deque(maxlen=600)
