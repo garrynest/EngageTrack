@@ -8,6 +8,7 @@ import cv2
 import numpy as np
 import torch
 from ultralytics import YOLO
+from torchvision.ops import nms
 import mediapipe as mp
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QLabel, QPushButton,
@@ -163,8 +164,8 @@ class VideoThread(QThread):
             face_mesh = mp.solutions.face_mesh.FaceMesh(
                 max_num_faces=10,
                 refine_landmarks=True,
-                min_detection_confidence=0.7,
-                min_tracking_confidence=0.7
+                min_detection_confidence=0.8,
+                min_tracking_confidence=0.8
             )
         except Exception as e:
             self.log_signal.emit(f"❌ Ошибка загрузки модели: {str(e)}")
@@ -199,7 +200,17 @@ class VideoThread(QThread):
                 break
 
             annotated = frame.copy()
-            results = yolo.track(frame, persist=True, classes=[0], tracker="bytetrack.yaml")
+
+            det_results = yolo.predict(frame, classes=[0], verbose=False)
+            if det_results[0].boxes is not None and len(det_results[0].boxes) > 0:
+                boxes_xyxy = det_results[0].boxes.xyxy.cpu()
+                confidences = det_results[0].boxes.conf.cpu()
+                keep_indices = nms(boxes_xyxy, confidences, iou_threshold=0.5)
+                filtered_boxes = boxes_xyxy[keep_indices]
+                results = yolo.track(frame, persist=True, classes=[0], tracker="bytetrack_classroom.yaml",
+                                     boxes=filtered_boxes)
+            else:
+                results = yolo.track(frame, persist=True, classes=[0], tracker="bytetrack_classroom.yaml")
 
             active_ids = set()
             class_engaged_count = 0
@@ -208,6 +219,10 @@ class VideoThread(QThread):
             if results[0].boxes.id is not None:
                 boxes = results[0].boxes.xyxy.cpu().int().numpy()
                 ids = results[0].boxes.id.int().cpu().numpy()
+
+                valid_mask = ids <= 50
+                boxes = boxes[valid_mask]
+                ids = ids[valid_mask]
 
                 if frame_count % 10 == 0 and frame_count > 0:
                     elapsed = time.time() - start_time
