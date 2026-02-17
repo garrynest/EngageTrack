@@ -150,7 +150,7 @@ class VideoThread(QThread):
         self.fps = 10
 
     def run(self):
-        model_path = Path("yolov8n.pt")
+        model_path = Path("yolo26n.pt")
         if not model_path.exists():
             self.log_signal.emit(f"❌ Файл модели не найден: {model_path.absolute()}")
             self.finished_signal.emit()
@@ -161,10 +161,10 @@ class VideoThread(QThread):
             yolo = YOLO(str(model_path))
             yolo.to(device)
             face_mesh = mp.solutions.face_mesh.FaceMesh(
-                max_num_faces=10,
+                max_num_faces=30,
                 refine_landmarks=True,
-                min_detection_confidence=0.8,
-                min_tracking_confidence=0.8
+                min_detection_confidence=0.85,
+                min_tracking_confidence=0.85
             )
         except Exception as e:
             self.log_signal.emit(f"❌ Ошибка загрузки модели: {str(e)}")
