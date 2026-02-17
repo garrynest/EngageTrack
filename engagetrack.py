@@ -17,6 +17,7 @@ from PyQt5.QtWidgets import (
 from PyQt5.QtCore import Qt, pyqtSignal, QThread
 from PyQt5.QtGui import QImage, QPixmap, QFont, QColor, QPalette, QIcon
 
+
 if sys.platform == "win32":
     BACKENDS = [
         (cv2.CAP_DSHOW, "DirectShow"),
@@ -34,7 +35,9 @@ else:
         (cv2.CAP_ANY, "Auto")
     ]
 
+
 RESOLUTIONS = {
+    "Full HD (1920×1080)": (1920, 1080),
     "720p (1280×720)": (1280, 720),
     "480p (854×480)": (854, 480),
     "360p (640×360)": (640, 360)
@@ -156,7 +159,19 @@ class VideoThread(QThread):
             self.finished_signal.emit()
             return
 
-        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        if torch.cuda.is_available():
+            device = 'cuda'
+            gpu_name = torch.cuda.get_device_name(0)
+            self.log_signal.emit(f"✅ GPU обнаружен: {gpu_name}")
+        elif hasattr(torch, 'directml') and torch.directml.is_available():
+            import torch_directml
+            device = torch_directml.device()
+            gpu_name = torch_directml.device_name(0)
+            self.log_signal.emit(f"✅ GPU (DirectML) обнаружен: {gpu_name}")
+        else:
+            device = 'cpu'
+            self.log_signal.emit("ℹ️ GPU недоступен. Используется CPU.")
+
         try:
             yolo = YOLO(str(model_path))
             yolo.to(device)
