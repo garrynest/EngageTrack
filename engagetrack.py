@@ -203,7 +203,11 @@ class VideoThread(QThread):
         self.log_signal.emit(f"📹 Анализ начат ({w}×{h})")
         mp_drawing = mp.solutions.drawing_utils
         mp_face_mesh = mp.solutions.face_mesh
-        MESH_STYLE = mp.solutions.drawing_styles.get_default_face_mesh_tesselation_style()
+        MESH_STYLE = mp_drawing.DrawingSpec(
+            color=(240, 230, 140),
+            thickness=1,
+            circle_radius=1
+        )
 
         frame_count = 0
         start_time = time.time()
