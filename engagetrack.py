@@ -16,6 +16,7 @@ from PyQt5.QtWidgets import (
 )
 from PyQt5.QtCore import Qt, pyqtSignal, QThread
 from PyQt5.QtGui import QImage, QPixmap, QFont, QColor, QPalette, QIcon
+from datetime import datetime
 
 
 if sys.platform == "win32":
@@ -151,6 +152,11 @@ class VideoThread(QThread):
         self._run_flag = False
         self.engagement_state = {}
         self.fps = 10
+        self.disengagement_count = {}
+        self.most_distracted_id = None
+        self.max_disengagements = 0
+        self.disengaged_images_dir = "disengaged_frames"
+        os.makedirs(self.disengaged_images_dir, exist_ok=True)
 
     def run(self):
         model_path = Path("yolo26n.pt")
@@ -307,18 +313,34 @@ class VideoThread(QThread):
                         if currently_engaged:
                             state['marked_disengaged'] = False
 
+                    is_disengaged_long = False
                     if not currently_engaged:
                         duration = current_time - state['start_time']
-                        if duration >= MIN_DISENGAGEMENT_DURATION:
+                        if duration >= MIN_DISENGAGEMENT_DURATION and not state['marked_disengaged']:
                             state['marked_disengaged'] = True
-                        else:
+                            is_disengaged_long = True
+
+                            self.disengagement_count[track_id] = self.disengagement_count.get(track_id, 0) + 1
+
+                            current_count = self.disengagement_count[track_id]
+                            if current_count > self.max_disengagements:
+                                self.max_disengagements = current_count
+                                self.most_distracted_id = track_id
+
+                            timestamp_str = datetime.now().strftime("%Y.%m.%d_%H-%M-%S")
+                            filename = f"{timestamp_str}_ID{track_id}.jpg"
+                            bbox_img = annotated[y1:y2, x1:x2].copy()
+                            saved = cv2.imwrite(os.path.join(self.disengaged_images_dir, filename), bbox_img)
+                            if not saved:
+                                self.log_signal.emit(f"⚠️ Не удалось сохранить изображение: {filename}")
+
+                        elif duration < MIN_DISENGAGEMENT_DURATION:
                             state['marked_disengaged'] = False
                     else:
                         state['marked_disengaged'] = False
 
-                    is_disengaged_long = state['marked_disengaged']
-                    color = (0, 0, 255) if is_disengaged_long else (0, 255, 0)
-                    if not is_disengaged_long:
+                    color = (0, 0, 255) if state['marked_disengaged'] else (0, 255, 0)
+                    if not state['marked_disengaged']:
                         class_engaged_count += 1
                     else:
                         disengaged_count += 1
@@ -360,6 +382,9 @@ class EngageTrackApp(QMainWindow):
         self.cumulative_engaged = 0
         self.max_disengaged_overall = 0
         self.engagement_history = []
+        self.most_distracted_id = None
+        self.max_disengagements = 0
+        self.ten_minute_checkpoints = []
 
         if os.path.exists("engagetrack.ico"):
             self.setWindowIcon(QIcon("engagetrack.ico"))
@@ -610,6 +635,9 @@ class EngageTrackApp(QMainWindow):
         self.cumulative_engaged = 0
         self.max_disengaged_overall = 0
         self.engagement_history = []
+        self.most_distracted_id = None
+        self.max_disengagements = 0
+        self.ten_minute_checkpoints = []
 
         self.start_button.setEnabled(False)
         self.stop_button.setEnabled(True)
@@ -639,6 +667,14 @@ class EngageTrackApp(QMainWindow):
             ratio = engaged / total if total > 0 else 0.0
             self.engagement_history.append(ratio)
 
+            # Сохраняем контрольную точку каждые 10 минут
+            elapsed_minutes = (time.time() - self.analysis_start_time) / 60
+            if len(self.ten_minute_checkpoints) == 0 or elapsed_minutes >= (len(self.ten_minute_checkpoints) * 10):
+                self.ten_minute_checkpoints.append({
+                    'time_min': round(elapsed_minutes, 1),
+                    'students_count': total
+                })
+
     def log_disengagement(self, disengaged_count):
         self.disengagement_log.append((time.time(), disengaged_count))
         current_time = time.time()
@@ -658,6 +694,9 @@ class EngageTrackApp(QMainWindow):
         self.on_thread_finished()
 
     def on_thread_finished(self):
+        if self.thread:
+            self.most_distracted_id = getattr(self.thread, 'most_distracted_id', None)
+            self.max_disengagements = getattr(self.thread, 'max_disengagements', 0)
         self.start_button.setEnabled(True)
         self.stop_button.setEnabled(False)
         self.export_button.setEnabled(True)
@@ -708,6 +747,24 @@ class EngageTrackApp(QMainWindow):
                 writer.writerow(["Макс. отвлечено за урок", str(self.max_disengaged_overall), "чел."])
                 writer.writerow([])
 
+                writer.writerow(["Самый отвлекающийся ученик"])
+                if self.most_distracted_id is not None:
+                    writer.writerow(["ID ученика", "Число отвлечений"])
+                    writer.writerow([self.most_distracted_id, self.max_disengagements])
+                else:
+                    writer.writerow(["Отвлечений не зафиксировано"])
+                writer.writerow([])
+
+                # Контрольные точки каждые 10 минут
+                writer.writerow(["Контрольные точки (каждые 10 мин)"])
+                if self.ten_minute_checkpoints:
+                    writer.writerow(["Время (мин)", "Число учеников"])
+                    for point in self.ten_minute_checkpoints:
+                        writer.writerow([point['time_min'], point['students_count']])
+                else:
+                    writer.writerow(["Данные не собраны"])
+                writer.writerow([])
+
                 error_entries = [
                     (ts, msg) for ts, msg in self.session_log
                     if "❌" in msg or "⚠️" in msg
@@ -727,26 +784,37 @@ class EngageTrackApp(QMainWindow):
                     import matplotlib.pyplot as plt
                     from scipy.ndimage import uniform_filter1d
 
-                    y = np.array(self.engagement_history)
-                    x = np.arange(len(y))
+                    engagement_array = np.array(self.engagement_history)
+                    total_seconds = time.time() - self.analysis_start_time if self.analysis_start_time else len(engagement_array) * 0.5
+                    time_seconds = np.linspace(0, total_seconds, len(engagement_array))
+                    time_minutes = time_seconds / 60
 
-                    window_size = max(1, len(y) // 20)
+                    window_size = max(1, len(engagement_array) // 20)
                     if window_size > 1:
-                        y_smooth = uniform_filter1d(y, size=window_size, mode='nearest')
+                        engagement_smooth = uniform_filter1d(engagement_array, size=window_size, mode='nearest')
                     else:
-                        y_smooth = y
+                        engagement_smooth = engagement_array
 
                     plt.figure(figsize=(10, 4))
-                    plt.plot(x, y_smooth * 100, color='#2ecc71', linewidth=1.8, label='Вовлечённость')
+                    plt.plot(time_minutes, engagement_smooth * 100, color='#2ecc71', linewidth=1.8, label='Вовлечённость')
+
                     plt.axhline(80, color='#2ecc71', linestyle='--', alpha=0.6, linewidth=1)
                     plt.axhline(30, color='#3498db', linestyle='--', alpha=0.6, linewidth=1)
-                    plt.fill_between(x, 80, 100, color='#2ecc71', alpha=0.1)
-                    plt.fill_between(x, 30, 80, color='#3498db', alpha=0.1)
-                    plt.fill_between(x, 0, 30, color='#e74c3c', alpha=0.1)
+
+                    plt.fill_between(time_minutes, 80, 100, color='#2ecc71', alpha=0.1)
+                    plt.fill_between(time_minutes, 30, 80, color='#3498db', alpha=0.1)
+                    plt.fill_between(time_minutes, 0, 30, color='#e74c3c', alpha=0.1)
+
                     plt.ylim(0, 100)
-                    plt.xlabel('Кадр')
+                    plt.xlim(0, max(time_minutes) if len(time_minutes) > 0 else 40)
+                    plt.xlabel('Время (минуты)')
                     plt.ylabel('Вовлечённость (%)')
                     plt.title('Динамика вовлечённости класса во время урока')
+
+                    max_min = int(max(time_minutes)) if len(time_minutes) > 0 else 40
+                    x_ticks = np.arange(0, max_min + 4, 4)
+                    plt.xticks(x_ticks)
+
                     plt.legend()
                     plt.tight_layout()
                     plt.savefig(plot_filename, dpi=150)
