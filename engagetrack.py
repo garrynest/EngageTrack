@@ -51,6 +51,7 @@ LEFT_EYE = 130
 RIGHT_EYE = 359
 LOG_MAX_LINES = 100
 MIN_DISENGAGEMENT_DURATION = 2.0
+MIN_GAZE_DISENGAGEMENT_DURATION = 5.0
 DISCONNECTION_WINDOW = 600
 
 
@@ -152,6 +153,7 @@ class VideoThread(QThread):
         self.resolution = resolution
         self._run_flag = False
         self.engagement_state = {}
+        self.gaze_disengagement_state = {}
         self.fps = 10
         self.disengagement_count = {}
         self.most_distracted_id = None
@@ -314,10 +316,21 @@ class VideoThread(QThread):
                                         gaze_x = abs(iris_center_x - w_face / 2) / w_face
                                         gaze_y = (iris_center_y - h_face / 3) / h_face
 
-                                        if gaze_y > 0.1 or gaze_x > 0.15:
-                                            currently_engaged = False
+                                        gaze_disengaged = gaze_y > 0.1 or gaze_x > 0.15
+
+                                        if gaze_disengaged:
+                                            current_time = time.time()
+                                            if track_id not in self.gaze_disengagement_state:
+                                                self.gaze_disengagement_state[track_id] = current_time
+                                            else:
+                                                duration = current_time - self.gaze_disengagement_state[track_id]
+                                                if duration >= MIN_GAZE_DISENGAGEMENT_DURATION:
+                                                    currently_engaged = False
+                                        else:
+                                            currently_engaged = True
+                                            self.gaze_disengagement_state.pop(track_id, None)
                                     except (IndexError, AttributeError):
-                                        pass
+                                        self.gaze_disengagement_state.pop(track_id, None)
 
                     if track_id not in self.engagement_state:
                         self.engagement_state[track_id] = {
@@ -371,6 +384,7 @@ class VideoThread(QThread):
                     cv2.putText(annotated, f'ID:{track_id}', (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
 
             self.engagement_state = {k: v for k, v in self.engagement_state.items() if k in active_ids}
+            self.gaze_disengagement_state = {k: v for k, v in self.gaze_disengagement_state.items() if k in active_ids}
 
             total_students = len(active_ids)
             self.stats_signal.emit(total_students, class_engaged_count)
