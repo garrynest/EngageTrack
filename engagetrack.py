@@ -910,13 +910,21 @@ class EngageTrackApp(QMainWindow):
         if all_stopped:
             if hasattr(self, 'progress_dialog'):
                 self.progress_dialog.close()
+
+            for widget in self.camera_widgets.values():
+                widget.clear()
+                widget.setText("Нажмите «Начать анализ» для запуска")
+                widget.setAlignment(Qt.AlignCenter)
+
             self.start_button.setEnabled(True)
             self.stop_button.setEnabled(False)
             self.export_button.setEnabled(True)
+
             for thread_id, cam_data in self.threads.items():
                 if cam_data['thread']:
                     self.most_distracted_id = getattr(cam_data['thread'], 'most_distracted_id', None)
                     self.max_disengagements = getattr(cam_data['thread'], 'max_disengagements', 0)
+
             self.stats_widget.update_stats(0, 0)
             self.stats_widget.update_disengagement_summary(0)
             self.log("Анализ остановлен.")
