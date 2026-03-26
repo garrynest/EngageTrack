@@ -2,8 +2,11 @@ import sys
 import os
 import csv
 import time
+import json
+import logging
 from pathlib import Path
 from collections import deque
+from datetime import datetime, timedelta
 import cv2
 import numpy as np
 import torch
@@ -12,12 +15,32 @@ import mediapipe as mp
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QLabel, QPushButton,
     QVBoxLayout, QHBoxLayout, QTextEdit, QFrame, QCheckBox,
-    QComboBox, QMessageBox, QSizePolicy
+    QComboBox, QMessageBox, QSizePolicy, QProgressDialog,
+    QSystemTrayIcon, QMenu, QAction, QGridLayout, QScrollArea, QStyle
 )
-from PyQt5.QtCore import Qt, pyqtSignal, QThread
+from PyQt5.QtCore import Qt, pyqtSignal, QThread, QTimer
 from PyQt5.QtGui import QImage, QPixmap, QFont, QColor, QPalette, QIcon
-from datetime import datetime
 
+DEFAULT_CONFIG = {
+    "nose_threshold": 0.25,
+    "pad_ratio": 0.25,
+    "min_disengagement_duration": 2.0,
+    "max_track_id": 50,
+    "resolution": "720p (1280x720)",
+    "save_images": True,
+    "auto_delete_images_days": 7,
+    "log_max_lines": 100,
+    "disconnection_window": 600,
+    "critical_engagement_threshold": 0.3,
+    "notification_cooldown": 300
+}
+
+RESOLUTIONS = {
+    "Full HD (1920x1080)": (1920, 1080),
+    "720p (1280x720)": (1280, 720),
+    "480p (854x480)": (854, 480),
+    "360p (640x360)": (640, 360)
+}
 
 if sys.platform == "win32":
     BACKENDS = [
@@ -36,23 +59,59 @@ else:
         (cv2.CAP_ANY, "Auto")
     ]
 
-
-RESOLUTIONS = {
-    "Full HD (1920x1080)": (1920, 1080),
-    "720p (1280x720)": (1280, 720),
-    "480p (854x480)": (854, 480),
-    "360p (640x360)": (640, 360)
-}
-
-NOSE_THRESHOLD = 0.25
-PAD_RATIO = 0.25
 NOSE = 1
 LEFT_EYE = 130
 RIGHT_EYE = 359
-LOG_MAX_LINES = 100
-MIN_DISENGAGEMENT_DURATION = 2.0
-MIN_GAZE_DISENGAGEMENT_DURATION = 2.0
-DISCONNECTION_WINDOW = 600
+
+
+def load_config():
+    config_path = Path("config.json")
+    if config_path.exists():
+        try:
+            with open(config_path, 'r', encoding='utf-8') as f:
+                config = json.load(f)
+                for key, value in DEFAULT_CONFIG.items():
+                    if key not in config:
+                        config[key] = value
+                return config
+        except Exception:
+            pass
+    config = DEFAULT_CONFIG.copy()
+    try:
+        with open(config_path, 'w', encoding='utf-8') as f:
+            json.dump(config, f, indent=4, ensure_ascii=False)
+    except Exception:
+        pass
+    return config
+
+
+def setup_logging():
+    logging.basicConfig(
+        filename='engagetrack.log',
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        encoding='utf-8'
+    )
+    logging.info("EngageTrack запущен")
+
+
+def cleanup_old_images(directory, days=7):
+    if not os.path.exists(directory):
+        return
+    cutoff = datetime.now() - timedelta(days=days)
+    deleted_count = 0
+    for filename in os.listdir(directory):
+        filepath = os.path.join(directory, filename)
+        if os.path.isfile(filepath):
+            try:
+                file_mtime = datetime.fromtimestamp(os.path.getmtime(filepath))
+                if file_mtime < cutoff:
+                    os.remove(filepath)
+                    deleted_count += 1
+            except Exception:
+                pass
+    if deleted_count > 0:
+        logging.info(f"Удалено {deleted_count} старых изображений")
 
 
 class EngagementStatsWidget(QWidget):
@@ -138,22 +197,24 @@ class EngagementStatsWidget(QWidget):
 
 
 class VideoThread(QThread):
-    change_pixmap_signal = pyqtSignal(np.ndarray)
+    change_pixmap_signal = pyqtSignal(np.ndarray, int)
     log_signal = pyqtSignal(str)
-    stats_signal = pyqtSignal(int, int)
+    stats_signal = pyqtSignal(int, int, int)
     disengagement_signal = pyqtSignal(int)
-    finished_signal = pyqtSignal()
+    finished_signal = pyqtSignal(int)
+    loading_progress_signal = pyqtSignal(int, int)
 
-    def __init__(self, camera_index=0, show_mesh=False, proctoring_mode=False, backend=cv2.CAP_ANY, resolution=(1280, 720)):
+    def __init__(self, camera_index=0, show_mesh=False, backend=cv2.CAP_ANY, resolution=(1280, 720), config=None,
+                 thread_id=0):
         super().__init__()
         self.camera_index = camera_index
         self.show_mesh = show_mesh
-        self.proctoring_mode = proctoring_mode
         self.backend = backend
         self.resolution = resolution
+        self.config = config or DEFAULT_CONFIG
+        self.thread_id = thread_id
         self._run_flag = False
         self.engagement_state = {}
-        self.gaze_disengagement_state = {}
         self.fps = 10
         self.disengagement_count = {}
         self.most_distracted_id = None
@@ -162,24 +223,34 @@ class VideoThread(QThread):
         os.makedirs(self.disengaged_images_dir, exist_ok=True)
 
     def run(self):
+        self.loading_progress_signal.emit(10, self.thread_id)
+
         model_path = Path("yolo26n.pt")
         if not model_path.exists():
             self.log_signal.emit(f"Файл модели не найден: {model_path.absolute()}")
-            self.finished_signal.emit()
+            logging.error(f"Модель не найдена: {model_path}")
+            self.finished_signal.emit(self.thread_id)
             return
+
+        self.loading_progress_signal.emit(30, self.thread_id)
 
         if torch.cuda.is_available():
             device = 'cuda'
             gpu_name = torch.cuda.get_device_name(0)
             self.log_signal.emit(f"GPU обнаружен: {gpu_name}")
+            logging.info(f"GPU обнаружен: {gpu_name}")
         elif hasattr(torch, 'directml') and torch.directml.is_available():
             import torch_directml
             device = torch_directml.device()
             gpu_name = torch_directml.device_name(0)
             self.log_signal.emit(f"GPU (DirectML) обнаружен: {gpu_name}")
+            logging.info(f"GPU (DirectML) обнаружен: {gpu_name}")
         else:
             device = 'cpu'
             self.log_signal.emit("GPU недоступен. Используется CPU.")
+            logging.info("Используется CPU")
+
+        self.loading_progress_signal.emit(50, self.thread_id)
 
         try:
             yolo = YOLO(str(model_path))
@@ -192,14 +263,20 @@ class VideoThread(QThread):
             )
         except Exception as e:
             self.log_signal.emit(f"Ошибка загрузки модели: {str(e)}")
-            self.finished_signal.emit()
+            logging.error(f"Ошибка загрузки модели: {e}")
+            self.finished_signal.emit(self.thread_id)
             return
 
-        self.log_signal.emit("Модели загружены. Запуск камеры...")
+        self.loading_progress_signal.emit(80, self.thread_id)
+
+        self.log_signal.emit(f"Камера {self.thread_id}: Модели загружены. Запуск...")
+        logging.info(f"Камера {self.thread_id}: Модели загружены")
+
         cap = cv2.VideoCapture(self.camera_index, self.backend)
         if not cap.isOpened():
-            self.log_signal.emit("Камера недоступна. Закройте другие программы.")
-            self.finished_signal.emit()
+            self.log_signal.emit(f"Камера {self.thread_id} недоступна.")
+            logging.error(f"Камера {self.thread_id} недоступна")
+            self.finished_signal.emit(self.thread_id)
             return
 
         w, h = self.resolution
@@ -209,7 +286,9 @@ class VideoThread(QThread):
         cap.set(cv2.CAP_PROP_FPS, 30)
 
         self._run_flag = True
-        self.log_signal.emit(f"Анализ начат ({w}x{h})")
+        self.log_signal.emit(f"Камера {self.thread_id}: Анализ начат ({w}x{h})")
+        logging.info(f"Камера {self.thread_id}: Анализ начат: {w}x{h}")
+
         mp_drawing = mp.solutions.drawing_utils
         mp_face_mesh = mp.solutions.face_mesh
         MESH_STYLE = mp_drawing.DrawingSpec(
@@ -218,12 +297,21 @@ class VideoThread(QThread):
             circle_radius=1
         )
 
+        NOSE_THRESHOLD = self.config.get("nose_threshold", 0.25)
+        PAD_RATIO = self.config.get("pad_ratio", 0.25)
+        MIN_DISENGAGEMENT_DURATION = self.config.get("min_disengagement_duration", 2.0)
+        MAX_TRACK_ID = self.config.get("max_track_id", 50)
+
         frame_count = 0
         start_time = time.time()
+
+        self.loading_progress_signal.emit(100, self.thread_id)
+
         while self._run_flag:
             ret, frame = cap.read()
             if not ret:
-                self.log_signal.emit("Камера отключена. Остановка.")
+                self.log_signal.emit(f"Камера {self.thread_id} отключена.")
+                logging.warning(f"Камера {self.thread_id} отключена")
                 break
 
             annotated = frame.copy()
@@ -244,7 +332,7 @@ class VideoThread(QThread):
                 boxes = results[0].boxes.xyxy.cpu().int().numpy()
                 ids = results[0].boxes.id.int().cpu().numpy()
 
-                valid_mask = ids <= 50
+                valid_mask = ids <= MAX_TRACK_ID
                 boxes = boxes[valid_mask]
                 ids = ids[valid_mask]
 
@@ -300,38 +388,6 @@ class VideoThread(QThread):
                                 offset = abs(nose_x - center) / width
                                 currently_engaged = offset <= NOSE_THRESHOLD
 
-                                if self.proctoring_mode:
-                                    try:
-                                        LEFT_IRIS_CENTER = 474
-                                        RIGHT_IRIS_CENTER = 469
-
-                                        left_iris_x = lm[LEFT_IRIS_CENTER].x * w_face
-                                        right_iris_x = lm[RIGHT_IRIS_CENTER].x * w_face
-                                        left_iris_y = lm[LEFT_IRIS_CENTER].y * h_face
-                                        right_iris_y = lm[RIGHT_IRIS_CENTER].y * h_face
-
-                                        iris_center_x = (left_iris_x + right_iris_x) / 2
-                                        iris_center_y = (left_iris_y + right_iris_y) / 2
-
-                                        gaze_x = abs(iris_center_x - w_face / 2) / w_face
-                                        gaze_y = (iris_center_y - h_face / 3) / h_face
-
-                                        gaze_disengaged = gaze_y > 0.1 or gaze_x > 0.15
-
-                                        if gaze_disengaged:
-                                            current_time = time.time()
-                                            if track_id not in self.gaze_disengagement_state:
-                                                self.gaze_disengagement_state[track_id] = current_time
-                                            else:
-                                                duration = current_time - self.gaze_disengagement_state[track_id]
-                                                if duration >= MIN_GAZE_DISENGAGEMENT_DURATION:
-                                                    currently_engaged = False
-                                        else:
-                                            currently_engaged = True
-                                            self.gaze_disengagement_state.pop(track_id, None)
-                                    except (IndexError, AttributeError):
-                                        self.gaze_disengagement_state.pop(track_id, None)
-
                     if track_id not in self.engagement_state:
                         self.engagement_state[track_id] = {
                             'engaged': currently_engaged,
@@ -363,11 +419,12 @@ class VideoThread(QThread):
                                 self.most_distracted_id = track_id
 
                             timestamp_str = datetime.now().strftime("%Y.%m.%d_%H-%M-%S")
-                            filename = f"{timestamp_str}_ID{track_id}.jpg"
+                            filename = f"{timestamp_str}_ID{track_id}_cam{self.thread_id}.jpg"
                             bbox_img = frame[y1:y2, x1:x2].copy()
                             saved = cv2.imwrite(os.path.join(self.disengaged_images_dir, filename), bbox_img)
                             if not saved:
                                 self.log_signal.emit(f"Не удалось сохранить изображение: {filename}")
+                                logging.warning(f"Не удалось сохранить изображение: {filename}")
 
                         elif duration < MIN_DISENGAGEMENT_DURATION:
                             state['marked_disengaged'] = False
@@ -384,21 +441,22 @@ class VideoThread(QThread):
                     cv2.putText(annotated, f'ID:{track_id}', (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
 
             self.engagement_state = {k: v for k, v in self.engagement_state.items() if k in active_ids}
-            self.gaze_disengagement_state = {k: v for k, v in self.gaze_disengagement_state.items() if k in active_ids}
 
             total_students = len(active_ids)
-            self.stats_signal.emit(total_students, class_engaged_count)
+            self.stats_signal.emit(total_students, class_engaged_count, self.thread_id)
             self.disengagement_signal.emit(disengaged_count)
 
-            cv2.putText(annotated, f'FPS: {self.fps:.1f}', (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-            self.change_pixmap_signal.emit(annotated)
+            cv2.putText(annotated, f'Cam{self.thread_id} FPS: {self.fps:.1f}', (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                        (255, 255, 255), 2)
+            self.change_pixmap_signal.emit(annotated, self.thread_id)
 
             frame_count += 1
 
         cap.release()
         if 'face_mesh' in locals():
             face_mesh.close()
-        self.finished_signal.emit()
+        self.finished_signal.emit(self.thread_id)
+        logging.info(f"Камера {self.thread_id}: Анализ остановлен")
 
     def stop(self):
         self._run_flag = False
@@ -408,8 +466,8 @@ class VideoThread(QThread):
 class EngageTrackApp(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("EngageTrack — Анализ вовлечённости учащихся")
-        self.resize(1150, 850)
+        self.setWindowTitle("EngageTrack - Анализ вовлечённости учащихся")
+        self.resize(1400, 900)
         self.is_dark_mode = False
         self.disengagement_log = deque(maxlen=600)
         self.analysis_start_time = None
@@ -421,6 +479,26 @@ class EngageTrackApp(QMainWindow):
         self.most_distracted_id = None
         self.max_disengagements = 0
         self.ten_minute_checkpoints = []
+        self.config = load_config()
+        setup_logging()
+        cleanup_old_images("disengaged_frames", self.config.get("auto_delete_images_days", 7))
+
+        self.threads = {}
+        self.camera_widgets = {}
+        self.last_notification_time = 0
+        self.notification_cooldown = self.config.get("notification_cooldown", 300)
+        self.critical_threshold = self.config.get("critical_engagement_threshold", 0.3)
+        self.notification_grace_period = 30
+        self.min_frames_for_notification = 100
+
+        self.tray_icon = QSystemTrayIcon(self)
+        self.tray_icon.setIcon(QApplication.style().standardIcon(QStyle.SP_MessageBoxWarning))
+        self.tray_menu = QMenu()
+        self.show_action = QAction("Показать", self)
+        self.show_action.triggered.connect(self.show)
+        self.tray_menu.addAction(self.show_action)
+        self.tray_icon.setContextMenu(self.tray_menu)
+        self.tray_icon.show()
 
         if os.path.exists("engagetrack.ico"):
             self.setWindowIcon(QIcon("engagetrack.ico"))
@@ -453,14 +531,27 @@ class EngageTrackApp(QMainWindow):
         privacy_label.setWordWrap(True)
         main_layout.addWidget(privacy_label)
 
+        self.notification_label = QLabel("")
+        self.notification_label.setFont(QFont("Segoe UI", 12, QFont.Bold))
+        self.notification_label.setAlignment(Qt.AlignCenter)
+        self.notification_label.setStyleSheet(
+            "color: #e74c3c; background-color: #fadbd8; padding: 10px; border-radius: 5px;")
+        self.notification_label.hide()
+        main_layout.addWidget(self.notification_label)
+
         control_frame = QFrame()
         control_layout = QHBoxLayout()
         control_layout.setContentsMargins(15, 10, 15, 10)
 
         cam_layout = QHBoxLayout()
-        cam_layout.addWidget(QLabel("Камера:"))
+        cam_layout.addWidget(QLabel("Камеры:"))
         self.camera_combo = QComboBox()
+        self.camera_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         cam_layout.addWidget(self.camera_combo)
+        self.add_camera_button = QPushButton("+ Добавить")
+        self.add_camera_button.setFixedWidth(100)
+        self.add_camera_button.clicked.connect(self.add_camera)
+        cam_layout.addWidget(self.add_camera_button)
         self.refresh_cam_button = QPushButton("Обновить")
         self.refresh_cam_button.setFixedWidth(100)
         self.refresh_cam_button.clicked.connect(self.detect_cameras)
@@ -472,17 +563,13 @@ class EngageTrackApp(QMainWindow):
         self.resolution_combo = QComboBox()
         for name in RESOLUTIONS.keys():
             self.resolution_combo.addItem(name)
-        self.resolution_combo.setCurrentText("720p (1280x720)")
+        self.resolution_combo.setCurrentText(self.config.get("resolution", "720p (1280x720)"))
         res_layout.addWidget(self.resolution_combo)
         control_layout.addLayout(res_layout)
 
         self.mesh_checkbox = QCheckBox("Показывать меш лица")
         self.mesh_checkbox.setChecked(False)
         control_layout.addWidget(self.mesh_checkbox)
-
-        self.proctoring_checkbox = QCheckBox("Режим прокторинга (анализ взгляда)")
-        self.proctoring_checkbox.setChecked(False)
-        control_layout.addWidget(self.proctoring_checkbox)
 
         self.start_button = QPushButton("Начать анализ")
         self.stop_button = QPushButton("Остановить")
@@ -500,12 +587,15 @@ class EngageTrackApp(QMainWindow):
         self.stats_widget = EngagementStatsWidget()
         main_layout.addWidget(self.stats_widget)
 
-        self.video_label = QLabel()
-        self.video_label.setAlignment(Qt.AlignCenter)
-        self.video_label.setMinimumSize(800, 450)
-        self.video_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        self.video_label.setText("Нажмите «Начать анализ» для запуска")
-        main_layout.addWidget(self.video_label)
+        self.video_container = QWidget()
+        self.video_layout = QGridLayout()
+        self.video_container.setLayout(self.video_layout)
+
+        scroll_area = QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setWidget(self.video_container)
+        scroll_area.setMinimumHeight(400)
+        main_layout.addWidget(scroll_area)
 
         log_frame = QFrame()
         log_layout = QVBoxLayout()
@@ -526,12 +616,16 @@ class EngageTrackApp(QMainWindow):
         self.stop_button.clicked.connect(self.stop_video)
         self.export_button.clicked.connect(self.export_report)
 
-        self.thread = None
         self.session_log = []
         self.detect_cameras()
         self.apply_theme()
 
+        self.notification_timer = QTimer()
+        self.notification_timer.timeout.connect(self.check_engagement_level)
+        self.notification_timer.start(1000)
+
         self.log("EngageTrack запущен. Нажмите «Обновить», если подключили новую камеру.")
+        logging.info("Приложение запущено")
 
     def detect_cameras(self):
         self.refresh_cam_button.setEnabled(False)
@@ -541,7 +635,7 @@ class EngageTrackApp(QMainWindow):
         self.camera_combo.clear()
 
         found_cameras = []
-        max_test_index = 5
+        max_test_index = 10
 
         for cam_id in range(max_test_index):
             cap = None
@@ -584,6 +678,32 @@ class EngageTrackApp(QMainWindow):
 
         self.refresh_cam_button.setText("Обновить")
         self.refresh_cam_button.setEnabled(True)
+
+    def add_camera(self):
+        cam_index = self.camera_combo.currentData()
+        if cam_index == -1:
+            QMessageBox.warning(self, "Нет камеры", "Выберите камеру для добавления.")
+            return
+
+        thread_id = len(self.threads)
+        self.threads[thread_id] = {
+            'camera_index': cam_index,
+            'thread': None,
+            'active': False
+        }
+
+        video_label = QLabel()
+        video_label.setAlignment(Qt.AlignCenter)
+        video_label.setMinimumSize(400, 300)
+        video_label.setText(f"Камера {thread_id}: Ожидание запуска")
+        self.camera_widgets[thread_id] = video_label
+
+        row = thread_id // 2
+        col = thread_id % 2
+        self.video_layout.addWidget(video_label, row, col)
+
+        self.log(f"Добавлена камера {thread_id} (ID: {cam_index})")
+        logging.info(f"Добавлена камера {thread_id}")
 
     def apply_theme(self):
         if self.is_dark_mode:
@@ -652,22 +772,28 @@ class EngageTrackApp(QMainWindow):
         full_msg = f"[{timestamp}] {msg}"
         self.session_log.append((timestamp, msg))
         self.log_text.append(full_msg)
+        LOG_MAX_LINES = self.config.get("log_max_lines", 100)
         if self.log_text.document().blockCount() > LOG_MAX_LINES:
             cursor = self.log_text.textCursor()
             cursor.movePosition(cursor.Start)
             cursor.select(cursor.LineUnderCursor)
             cursor.removeSelectedText()
             cursor.deleteChar()
+        logging.info(msg)
 
     def start_video(self):
-        cam_index = self.camera_combo.currentData()
-        if cam_index == -1:
-            QMessageBox.warning(self, "Нет камеры", "Камера недоступна.")
+        if not self.threads:
+            QMessageBox.warning(self, "Нет камер", "Добавьте хотя бы одну камеру.")
             return
 
         backend = cv2.CAP_DSHOW if sys.platform == "win32" else cv2.CAP_ANY
         res_name = self.resolution_combo.currentText()
         resolution = RESOLUTIONS[res_name]
+
+        self.progress_dialog = QProgressDialog("Загрузка моделей ИИ...", None, 0, 100, self)
+        self.progress_dialog.setWindowModality(Qt.WindowModal)
+        self.progress_dialog.setMinimumDuration(0)
+        self.progress_dialog.show()
 
         self.analysis_start_time = time.time()
         self.total_frames = 0
@@ -678,28 +804,37 @@ class EngageTrackApp(QMainWindow):
         self.most_distracted_id = None
         self.max_disengagements = 0
         self.ten_minute_checkpoints = []
+        self.last_notification_time = time.time() + self.notification_grace_period
 
         self.start_button.setEnabled(False)
         self.stop_button.setEnabled(True)
         self.export_button.setEnabled(False)
-        self.video_label.setText("Загрузка моделей ИИ... Подождите.")
+        self.notification_label.hide()
         self.log("Запуск...")
 
-        self.thread = VideoThread(
-            camera_index=cam_index,
-            show_mesh=self.mesh_checkbox.isChecked(),
-            proctoring_mode=self.proctoring_checkbox.isChecked(),
-            backend=backend,
-            resolution=resolution
-        )
-        self.thread.change_pixmap_signal.connect(self.update_image)
-        self.thread.log_signal.connect(self.log)
-        self.thread.stats_signal.connect(self.on_student_stats_update)
-        self.thread.disengagement_signal.connect(self.log_disengagement)
-        self.thread.finished_signal.connect(self.on_thread_finished)
-        self.thread.start()
+        for thread_id, cam_data in self.threads.items():
+            thread = VideoThread(
+                camera_index=cam_data['camera_index'],
+                show_mesh=self.mesh_checkbox.isChecked(),
+                backend=backend,
+                resolution=resolution,
+                config=self.config,
+                thread_id=thread_id
+            )
+            thread.change_pixmap_signal.connect(self.update_image)
+            thread.log_signal.connect(self.log)
+            thread.stats_signal.connect(self.on_student_stats_update)
+            thread.disengagement_signal.connect(self.log_disengagement)
+            thread.finished_signal.connect(self.on_thread_finished)
+            thread.loading_progress_signal.connect(self.update_progress)
+            thread.start()
+            cam_data['thread'] = thread
+            cam_data['active'] = True
 
-    def on_student_stats_update(self, total, engaged):
+    def update_progress(self, value, thread_id):
+        self.progress_dialog.setValue(value)
+
+    def on_student_stats_update(self, total, engaged, thread_id):
         self.stats_widget.update_stats(total, engaged)
         if self.analysis_start_time is not None:
             self.total_frames += 1
@@ -715,12 +850,45 @@ class EngageTrackApp(QMainWindow):
                     'students_count': total
                 })
 
+    def check_engagement_level(self):
+        if self.analysis_start_time is None:
+            return
+
+        if self.total_frames < self.min_frames_for_notification:
+            return
+
+        current_time = time.time()
+        if current_time < self.last_notification_time:
+            return
+
+        current_ratio = self.stats_widget.engagement_ratio
+
+        if current_ratio < self.critical_threshold:
+            self.last_notification_time = current_time + self.notification_cooldown
+            self.show_critical_notification(current_ratio)
+        else:
+            self.notification_label.hide()
+
+    def show_critical_notification(self, ratio):
+        self.notification_label.setText(f"ВНИМАНИЕ: Вовлечённость критически низкая ({ratio:.0%})!")
+        self.notification_label.show()
+
+        self.tray_icon.showMessage(
+            "EngageTrack - Внимание!",
+            f"Вовлечённость класса упала до {ratio:.0%}",
+            QSystemTrayIcon.Critical,
+            5000
+        )
+
+        self.log(f"Критическая вовлечённость: {ratio:.0%}")
+        logging.warning(f"Критическая вовлечённость: {ratio:.0%}")
+
     def log_disengagement(self, disengaged_count):
         self.disengagement_log.append((time.time(), disengaged_count))
         current_time = time.time()
         recent_values = [
             count for ts, count in self.disengagement_log
-            if current_time - ts <= DISCONNECTION_WINDOW
+            if current_time - ts <= self.config.get("disconnection_window", 600)
         ]
         max_disengaged_10min = max(recent_values) if recent_values else 0
         self.stats_widget.update_disengagement_summary(max_disengaged_10min)
@@ -729,33 +897,43 @@ class EngageTrackApp(QMainWindow):
             self.max_disengaged_overall = disengaged_count
 
     def stop_video(self):
-        if self.thread:
-            self.thread.stop()
-        self.on_thread_finished()
+        for thread_id, cam_data in self.threads.items():
+            if cam_data['thread']:
+                cam_data['thread'].stop()
 
-    def on_thread_finished(self):
-        if self.thread:
-            self.most_distracted_id = getattr(self.thread, 'most_distracted_id', None)
-            self.max_disengagements = getattr(self.thread, 'max_disengagements', 0)
-        self.start_button.setEnabled(True)
-        self.stop_button.setEnabled(False)
-        self.export_button.setEnabled(True)
-        self.video_label.setText("Нажмите «Начать анализ» для запуска")
-        self.stats_widget.update_stats(0, 0)
-        self.stats_widget.update_disengagement_summary(0)
-        self.log("Анализ остановлен.")
+    def on_thread_finished(self, thread_id=-1):
+        if thread_id >= 0 and thread_id in self.threads:
+            self.threads[thread_id]['active'] = False
 
-    def update_image(self, cv_img):
-        rgb_image = cv2.cvtColor(cv_img, cv2.COLOR_BGR2RGB)
-        h, w, ch = rgb_image.shape
-        bytes_per_line = ch * w
-        qt_image = QImage(rgb_image.data, w, h, bytes_per_line, QImage.Format_RGB888)
-        pixmap = QPixmap.fromImage(qt_image)
-        self.video_label.setPixmap(pixmap.scaled(
-            self.video_label.size(),
-            Qt.KeepAspectRatio,
-            Qt.SmoothTransformation
-        ))
+        all_stopped = all(not cam['active'] for cam in self.threads.values())
+
+        if all_stopped:
+            if hasattr(self, 'progress_dialog'):
+                self.progress_dialog.close()
+            self.start_button.setEnabled(True)
+            self.stop_button.setEnabled(False)
+            self.export_button.setEnabled(True)
+            for thread_id, cam_data in self.threads.items():
+                if cam_data['thread']:
+                    self.most_distracted_id = getattr(cam_data['thread'], 'most_distracted_id', None)
+                    self.max_disengagements = getattr(cam_data['thread'], 'max_disengagements', 0)
+            self.stats_widget.update_stats(0, 0)
+            self.stats_widget.update_disengagement_summary(0)
+            self.log("Анализ остановлен.")
+            logging.info("Анализ остановлен пользователем")
+
+    def update_image(self, cv_img, thread_id):
+        if thread_id in self.camera_widgets:
+            rgb_image = cv2.cvtColor(cv_img, cv2.COLOR_BGR2RGB)
+            h, w, ch = rgb_image.shape
+            bytes_per_line = ch * w
+            qt_image = QImage(rgb_image.data, w, h, bytes_per_line, QImage.Format_RGB888)
+            pixmap = QPixmap.fromImage(qt_image)
+            self.camera_widgets[thread_id].setPixmap(pixmap.scaled(
+                self.camera_widgets[thread_id].size(),
+                Qt.KeepAspectRatio,
+                Qt.SmoothTransformation
+            ))
 
     def export_report(self):
         timestamp_str = time.strftime('%Y%m%d_%H%M%S')
@@ -824,7 +1002,8 @@ class EngageTrackApp(QMainWindow):
                     from scipy.ndimage import uniform_filter1d
 
                     engagement_array = np.array(self.engagement_history)
-                    total_seconds = time.time() - self.analysis_start_time if self.analysis_start_time else len(engagement_array) * 0.5
+                    total_seconds = time.time() - self.analysis_start_time if self.analysis_start_time else len(
+                        engagement_array) * 0.5
                     time_seconds = np.linspace(0, total_seconds, len(engagement_array))
                     time_minutes = time_seconds / 60
 
@@ -835,7 +1014,8 @@ class EngageTrackApp(QMainWindow):
                         engagement_smooth = engagement_array
 
                     plt.figure(figsize=(10, 4))
-                    plt.plot(time_minutes, engagement_smooth * 100, color='#2ecc71', linewidth=1.8, label='Вовлечённость')
+                    plt.plot(time_minutes, engagement_smooth * 100, color='#2ecc71', linewidth=1.8,
+                             label='Вовлечённость')
 
                     plt.axhline(80, color='#2ecc71', linestyle='--', alpha=0.6, linewidth=1)
                     plt.axhline(30, color='#3498db', linestyle='--', alpha=0.6, linewidth=1)
@@ -860,15 +1040,21 @@ class EngageTrackApp(QMainWindow):
                     plt.close()
                 except Exception as e:
                     self.log(f"Не удалось сохранить график: {e}")
+                    logging.error(f"Ошибка сохранения графика: {e}")
 
             QMessageBox.information(self, "Экспорт завершён",
                                     f"Отчёт и график сохранены:\n{os.path.abspath(csv_filename)}")
+            logging.info(f"Отчёт экспортирован: {csv_filename}")
         except Exception as e:
             QMessageBox.critical(self, "Ошибка экспорта", f"Не удалось сохранить отчёт:\n{str(e)}")
+            logging.error(f"Ошибка экспорта: {e}")
 
     def closeEvent(self, event):
-        if self.thread:
-            self.thread.stop()
+        for thread_id, cam_data in self.threads.items():
+            if cam_data['thread']:
+                cam_data['thread'].stop()
+        self.notification_timer.stop()
+        logging.info("Приложение закрыто")
         event.accept()
 
 
